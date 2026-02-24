@@ -71,6 +71,19 @@ export function RestaurantCard({ restaurant, menuLoading = false }: Props) {
           </p>
         ) : null}
 
+        {/* 베스트 리뷰 */}
+        {restaurant.bestReview && (
+          <div className="bg-[#FFFBEB] dark:bg-[#1C1407] p-3 rounded-[10px]">
+            <div className="flex items-center gap-1 mb-1">
+              <span className="text-[12px]">⭐ {restaurant.bestReview.rating.toFixed(1)}</span>
+              <span className="text-[12px] text-[#A8A29E]">— {restaurant.bestReview.authorName}</span>
+            </div>
+            <p className="text-[13px] text-[#78716C] dark:text-[#A8A29E] line-clamp-2">
+              &ldquo;{restaurant.bestReview.text}&rdquo;
+            </p>
+          </div>
+        )}
+
         {/* 평점 + 가격 */}
         <div className="flex items-center gap-3 text-[12px] text-[#78716C] dark:text-[#A8A29E]">
           <span>⭐ {rating.toFixed(1)} ({userRatingsTotal.toLocaleString()})</span>

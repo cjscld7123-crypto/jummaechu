@@ -1,6 +1,6 @@
 'use client'
 
-import { useState, useCallback } from 'react'
+import { useState, useCallback, useEffect } from 'react'
 import { Header } from '@/components/layout/Header'
 import { PrimaryButton } from '@/components/ui/PrimaryButton'
 import { FilterChip } from '@/components/ui/FilterChip'
@@ -14,10 +14,10 @@ import { EXCLUDE_TAG_LABEL, PRICE_BAND_LABEL } from '@/types'
 
 // ── 필터 옵션 ─────────────────────────────────────────────────────────
 const RADIUS_OPTIONS: { label: string; value: Radius }[] = [
-  { label: '300m', value: 300 },
-  { label: '500m', value: 500 },
-  { label: '700m', value: 700 },
-  { label: '1km',  value: 1000 },
+  { label: '3분',  value: 300 },
+  { label: '5분',  value: 500 },
+  { label: '10분', value: 700 },
+  { label: '15분', value: 1000 },
 ]
 
 const PRICE_OPTIONS: { label: string; value: PriceBand | 'all' }[] = [
@@ -28,6 +28,22 @@ const PRICE_OPTIONS: { label: string; value: PriceBand | 'all' }[] = [
 ]
 
 const ALL_EXCLUDE_TAGS = Object.keys(EXCLUDE_TAG_LABEL) as ExcludeTag[]
+
+const LIKED_STORAGE_KEY = 'jummaechu_liked'
+
+// ── localStorage 좋아요 기록 읽기/쓰기 ─────────────────────────────────
+function loadLikedFromStorage(): Restaurant[] {
+  if (typeof window === 'undefined') return []
+  try {
+    return JSON.parse(localStorage.getItem(LIKED_STORAGE_KEY) ?? '[]')
+  } catch { return [] }
+}
+
+function saveLikedToStorage(liked: Restaurant[]) {
+  try {
+    localStorage.setItem(LIKED_STORAGE_KEY, JSON.stringify(liked))
+  } catch { /* 용량 초과 등 무시 */ }
+}
 
 // ── Haversine 거리 계산 (m 단위) ─────────────────────────────────────
 function haversineDistance(lat1: number, lng1: number, lat2: number, lng2: number): number {
@@ -60,18 +76,32 @@ function rankRestaurants(list: Restaurant[]): Restaurant[] {
 }
 
 // ── 가중치 랜덤 선택 ──────────────────────────────────────────────────
-// 싫어요 횟수가 많은 카테고리는 선택 확률이 낮아짐 (최솟값 0.1 — 완전 배제 방지)
+// excludeTags 교집합, excluded, 싫어요 카테고리 감소, 좋아요 카테고리 부스트
 function pickWeighted(
   pool: Restaurant[],
   shown: Set<string>,
   dislikedCats: Record<string, number>,
+  userExcludeTags: Set<ExcludeTag>,
+  likedCats?: Record<string, number>,
 ): Restaurant | null {
-  const available = pool.filter((r) => !shown.has(r.placeId) && !r.excluded)
+  const available = pool.filter((r) => {
+    if (shown.has(r.placeId)) return false
+    if (r.excluded) return false
+    // 칩 태그와 GPT 태그 교집합 → 제외 (enrichment 완료된 경우만)
+    if (r.tags.length > 0 && r.tags.some((t) => userExcludeTags.has(t))) return false
+    return true
+  })
   if (available.length === 0) return null
 
-  const weights = available.map((r) =>
-    Math.max(0.1, 1 / (1 + (dislikedCats[r.category] ?? 0) * 0.7)),
-  )
+  const weights = available.map((r) => {
+    let w = Math.max(0.1, 1 / (1 + (dislikedCats[r.category] ?? 0) * 0.7))
+    // 이전 좋아요 카테고리 부스트 (#6)
+    if (likedCats) {
+      const likeCount = likedCats[r.category] ?? 0
+      if (likeCount > 0) w *= Math.pow(1.3, Math.min(likeCount, 5))
+    }
+    return w
+  })
   const total = weights.reduce((a, b) => a + b, 0)
   let rand = Math.random() * total
   for (let i = 0; i < available.length; i++) {
@@ -79,6 +109,32 @@ function pickWeighted(
     if (rand <= 0) return available[i]
   }
   return available[available.length - 1]
+}
+
+// ── 풀 소진 시 카테고리별 Top 3 선택 (#6) ────────────────────────────
+function pickTop3ByCategory(liked: Restaurant[]): Restaurant[] {
+  if (liked.length === 0) return []
+  // 카테고리별 그룹화
+  const groups: Record<string, Restaurant[]> = {}
+  for (const r of liked) {
+    if (!groups[r.category]) groups[r.category] = []
+    groups[r.category].push(r)
+  }
+  // 가장 많은 카테고리 순으로 정렬
+  const sorted = Object.entries(groups).sort((a, b) => b[1].length - a[1].length)
+  // 상위 3개 카테고리에서 각각 rating 가장 높은 1개
+  return sorted.slice(0, 3).map(([, restaurants]) =>
+    restaurants.sort((a, b) => b.rating - a.rating)[0]
+  )
+}
+
+// ── 좋아요 카테고리 빈도 계산 ────────────────────────────────────────
+function countLikedCategories(liked: Restaurant[]): Record<string, number> {
+  const counts: Record<string, number> = {}
+  for (const r of liked) {
+    counts[r.category] = (counts[r.category] ?? 0) + 1
+  }
+  return counts
 }
 
 type Step = 'filter' | 'loading' | 'tinder' | 'empty'
@@ -100,7 +156,14 @@ export default function RecommendPage() {
   const [dislikedCategories, setDislikedCategories] = useState<Record<string, number>>({})
   // AI 메뉴 보강 중인 placeId 집합
   const [enrichingIds, setEnrichingIds] = useState<Set<string>>(new Set())
+  // 좋아요 누른 식당 목록 — localStorage에서 초기화 (#6)
+  const [likedRestaurants, setLikedRestaurants] = useState<Restaurant[]>([])
   const [apiError, setApiError] = useState<string | null>(null)
+
+  // localStorage에서 좋아요 기록 로드 (클라이언트 전용)
+  useEffect(() => {
+    setLikedRestaurants(loadLikedFromStorage())
+  }, [])
 
   const toggleTag = (tag: ExcludeTag) => {
     setExcludeTags((prev) => {
@@ -120,50 +183,87 @@ export default function RecommendPage() {
     setCustomInput('')
   }
 
-  // AI 메뉴 보강 — 1장씩 호출, currentCard + candidatePool 동기화
-  const enrichMenus = useCallback(async (restaurants: Restaurant[]) => {
-    if (restaurants.length === 0) return
-    setEnrichingIds(new Set(restaurants.map((r) => r.placeId)))
+  // 단일 식당 enrichment (await 가능) — #8 레이스 컨디션 해결용
+  const enrichSingle = useCallback(async (
+    r: Restaurant,
+    tags: Set<ExcludeTag>,
+    keywords: string[],
+  ): Promise<Restaurant> => {
+    try {
+      const res = await fetch('/api/menu/enrich', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          name: r.name,
+          category: r.category,
+          address: r.address,
+          excludeKeywords: keywords.length > 0 ? keywords : undefined,
+          excludeTags: tags.size > 0 ? [...tags] : undefined,
+        }),
+      })
+      if (res.ok) {
+        const data = await res.json() as { menus?: string[]; tags?: ExcludeTag[]; excluded?: boolean; category?: string }
+        return {
+          ...r,
+          representativeMenus: data.menus ?? [],
+          tags: data.tags ?? [],
+          excluded: data.excluded ?? false,
+          // GPT가 교정한 카테고리 반영 (Google Places 분류가 부정확할 수 있음)
+          ...(data.category && { category: data.category as Restaurant['category'] }),
+        }
+      }
+    } catch { /* 개별 실패 무시 */ }
+    return r
+  }, [])
 
-    await Promise.allSettled(
-      restaurants.map(async (r) => {
-        try {
-          const res = await fetch('/api/menu/enrich', {
-            method: 'POST',
-            headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({
-              name: r.name,
-              category: r.category,
-              address: r.address,
-              excludeKeywords: customExcludes.length > 0 ? customExcludes : undefined,
-            }),
-          })
-          if (res.ok) {
-            const data = await res.json() as { menus?: string[]; tags?: ExcludeTag[]; excluded?: boolean }
-            const menus = data.menus ?? []
-            const tags = data.tags ?? []
-            const excluded = data.excluded ?? false
-            setCurrentCard((prev) =>
-              prev?.placeId === r.placeId ? { ...prev, representativeMenus: menus, tags, excluded } : prev,
-            )
-            setCandidatePool((prev) =>
-              prev.map((item) =>
-                item.placeId === r.placeId ? { ...item, representativeMenus: menus, tags, excluded } : item,
-              ),
-            )
+  // 배경 enrichment — 나머지 후보를 3개씩 배치로 점진적으로 보강
+  const enrichBackground = useCallback(async (
+    restaurants: Restaurant[],
+    tags: Set<ExcludeTag>,
+    keywords: string[],
+  ) => {
+    setEnrichingIds(new Set(restaurants.map((r) => r.placeId)))
+    const BATCH_SIZE = 3
+    for (let i = 0; i < restaurants.length; i += BATCH_SIZE) {
+      const batch = restaurants.slice(i, i + BATCH_SIZE)
+      await Promise.allSettled(
+        batch.map(async (r) => {
+          const enriched = await enrichSingle(r, tags, keywords)
+          setCandidatePool((prev) =>
+            prev.map((item) =>
+              item.placeId === r.placeId ? enriched : item,
+            ),
+          )
+          // enrichment 완료 후 현재 카드가 제외 대상이면 자동 스킵 (#8-D)
+          if (enriched.excluded || enriched.tags.some((t) => tags.has(t as ExcludeTag))) {
+            setCurrentCard((prev) => {
+              if (prev?.placeId === r.placeId) {
+                return null // useEffect에서 처리
+              }
+              return prev
+            })
           }
-        } catch {
-          // 개별 실패 무시
-        } finally {
           setEnrichingIds((prev) => {
             const next = new Set(prev)
             next.delete(r.placeId)
             return next
           })
-        }
-      }),
-    )
-  }, [customExcludes])
+        }),
+      )
+    }
+  }, [enrichSingle])
+
+  // 현재 카드가 null이 되면 (제외로 인해) 다음 카드 자동 선택
+  useEffect(() => {
+    if (step === 'tinder' && currentCard === null) {
+      const next = pickWeighted(candidatePool, shownIds, dislikedCategories, excludeTags)
+      if (next) {
+        setCurrentCard(next)
+      } else {
+        setStep('empty')
+      }
+    }
+  }, [step, currentCard, candidatePool, shownIds, dislikedCategories, excludeTags])
 
   const recommend = useCallback(async () => {
     if (!location) return
@@ -171,12 +271,14 @@ export default function RecommendPage() {
     setApiError(null)
     setShownIds(new Set())
     setDislikedCategories({})
+    // #6: 좋아요 기록은 초기화하지 않음 (localStorage 유지)
 
     try {
       const params = new URLSearchParams({
         lat: String(location.lat),
         lng: String(location.lng),
         radius: String(radius),
+        ...(priceBand !== 'all' && { priceBand }),
       })
       const res = await fetch(`/api/places/search?${params}`)
       const data: { restaurants?: Restaurant[]; message?: string } = await res.json()
@@ -189,7 +291,7 @@ export default function RecommendPage() {
 
       let filtered: Restaurant[] = data.restaurants ?? []
 
-      // 가격대 필터 (null = 정보 없음 → 포함하되 후순위)
+      // 가격대 클라이언트 이중 필터 (서버에서도 처리하지만 안전장치)
       if (priceBand !== 'all') {
         filtered = filtered.filter((r) => r.priceBand === priceBand || r.priceBand === null)
       }
@@ -206,37 +308,70 @@ export default function RecommendPage() {
 
       setCandidatePool(ranked)
 
-      const first = pickWeighted(ranked, new Set(), {})
+      // #8-E: 첫 카드를 enrichment 완료 후 표시 (레이스 컨디션 해결)
+      const localShown = new Set<string>()
+      let first: Restaurant | null = null
+
+      for (const candidate of ranked) {
+        const enriched = await enrichSingle(candidate, excludeTags, customExcludes)
+        // candidatePool에 enrichment 결과 반영
+        setCandidatePool((prev) =>
+          prev.map((item) => item.placeId === candidate.placeId ? enriched : item),
+        )
+        // 제외 체크
+        if (enriched.excluded || enriched.tags.some((t) => excludeTags.has(t as ExcludeTag))) {
+          localShown.add(candidate.placeId)
+          continue
+        }
+        first = enriched
+        break
+      }
+
       if (!first) {
-        setApiError('주변에 음식점이 없어요.')
+        setApiError('조건에 맞는 음식점이 없어요. 필터를 조정해보세요.')
         setStep('filter')
         return
       }
 
       setCurrentCard(first)
-      setShownIds(new Set([first.placeId]))
+      setShownIds(new Set([...localShown, first.placeId]))
       setStep('tinder')
-      enrichMenus([first])
+
+      // 나머지 후보는 백그라운드 enrichment
+      const remaining = ranked.filter(
+        (r) => r.placeId !== first!.placeId && !localShown.has(r.placeId)
+      )
+      if (remaining.length > 0) {
+        enrichBackground(remaining, excludeTags, customExcludes)
+      }
     } catch {
       setApiError('네트워크 오류가 발생했어요. 잠시 후 다시 시도해주세요.')
       setStep('filter')
     }
-  }, [location, radius, priceBand, enrichMenus])
+  }, [location, radius, priceBand, excludeTags, customExcludes, enrichSingle, enrichBackground])
+
+  // 좋아요 카테고리 빈도 (가중치 부스트용)
+  const likedCats = countLikedCategories(likedRestaurants)
 
   // 좋아요 — Google Maps 열고 다음 카드
   const handleLike = useCallback(() => {
     if (!currentCard) return
     window.open(currentCard.mapUrl, '_blank')
+    // 좋아요 목록에 저장 + localStorage 업데이트 (#6)
+    setLikedRestaurants((prev) => {
+      const updated = [...prev, currentCard]
+      saveLikedToStorage(updated)
+      return updated
+    })
     const newShown = new Set([...shownIds, currentCard.placeId])
     setShownIds(newShown)
-    const next = pickWeighted(candidatePool, newShown, dislikedCategories)
+    const next = pickWeighted(candidatePool, newShown, dislikedCategories, excludeTags, likedCats)
     if (next) {
       setCurrentCard(next)
-      enrichMenus([next])
     } else {
       setStep('empty')
     }
-  }, [currentCard, shownIds, dislikedCategories, candidatePool, enrichMenus])
+  }, [currentCard, shownIds, dislikedCategories, candidatePool, excludeTags, likedCats])
 
   // 싫어요 — 카테고리 가중치 낮추고 다음 카드
   const handleDislike = useCallback(() => {
@@ -248,17 +383,24 @@ export default function RecommendPage() {
     const newShown = new Set([...shownIds, currentCard.placeId])
     setDislikedCategories(newDislikedCats)
     setShownIds(newShown)
-    const next = pickWeighted(candidatePool, newShown, newDislikedCats)
+    const next = pickWeighted(candidatePool, newShown, newDislikedCats, excludeTags, likedCats)
     if (next) {
       setCurrentCard(next)
-      enrichMenus([next])
     } else {
       setStep('empty')
     }
-  }, [currentCard, shownIds, dislikedCategories, candidatePool, enrichMenus])
+  }, [currentCard, shownIds, dislikedCategories, candidatePool, excludeTags, likedCats])
 
-  // 남은 카드 수 (excluded 제외)
-  const remaining = candidatePool.filter((r) => !shownIds.has(r.placeId) && !r.excluded).length
+  // 남은 카드 수 (excluded + 태그 매칭 제외)
+  const remaining = candidatePool.filter((r) => {
+    if (shownIds.has(r.placeId)) return false
+    if (r.excluded) return false
+    if (r.tags.length > 0 && r.tags.some((t) => excludeTags.has(t))) return false
+    return true
+  }).length
+
+  // 풀 소진 시 카테고리별 Top 3 (#6)
+  const top3Liked = pickTop3ByCategory(likedRestaurants)
 
   return (
     <div className="min-h-screen bg-[#FAFAF9] dark:bg-[#0C0A09]">
@@ -270,7 +412,7 @@ export default function RecommendPage() {
           <LocationSelector value={location} onChange={setLocation} />
 
           <section className="space-y-3">
-            <h2 className="text-[17px] font-semibold text-[#1C1917] dark:text-[#FAFAF9]">반경</h2>
+            <h2 className="text-[17px] font-semibold text-[#1C1917] dark:text-[#FAFAF9]">도보 시간</h2>
             <SegmentedControl options={RADIUS_OPTIONS} value={radius} onChange={setRadius} />
           </section>
 
@@ -349,7 +491,7 @@ export default function RecommendPage() {
       {step === 'loading' && (
         <main className="max-w-[480px] mx-auto px-4 py-6 space-y-4">
           <p className="text-[14px] text-[#78716C] dark:text-[#A8A29E] text-center">
-            주변 식당을 찾고 있어요...
+            필터 조건 확인 중...
           </p>
           <SkeletonCard />
         </main>
@@ -391,35 +533,70 @@ export default function RecommendPage() {
             </button>
           </div>
 
-          {/* 싫어요 피드백 — 어떤 카테고리를 덜 추천하는지 표시 */}
-          {Object.keys(dislikedCategories).length > 0 && (
-            <p className="text-[12px] text-[#A8A29E] dark:text-[#57534E] text-center">
-              {Object.entries(dislikedCategories)
-                .sort((a, b) => b[1] - a[1])
-                .slice(0, 3)
-                .map(([cat]) => cat)
-                .join(', ')} 덜 추천 중
-            </p>
-          )}
+          <p className="text-[12px] text-[#A8A29E] dark:text-[#57534E] text-center">
+            추천 정보는 실제와 차이가 있을 수 있습니다.
+          </p>
         </main>
       )}
 
       {/* ── 풀 소진 단계 ───────────────────────────────────── */}
       {step === 'empty' && (
-        <main className="max-w-[480px] mx-auto px-4 flex flex-col items-center justify-center min-h-[60vh] space-y-4 text-center">
-          <span className="text-5xl">🍽️</span>
-          <h2 className="text-[17px] font-semibold text-[#1C1917] dark:text-[#FAFAF9]">
-            주변 식당을 모두 봤어요
-          </h2>
-          <p className="text-[14px] text-[#78716C] dark:text-[#A8A29E]">
-            반경을 넓히거나 조건을 바꿔보세요
-          </p>
-          <button
-            onClick={() => setStep('filter')}
-            className="mt-2 h-[52px] px-8 rounded-[12px] bg-[#F97316] hover:bg-[#EA580C] text-white text-[15px] font-semibold transition-colors"
-          >
-            조건 다시 설정
-          </button>
+        <main className="max-w-[480px] mx-auto px-4 py-6 space-y-6">
+          <div className="flex flex-col items-center text-center space-y-4">
+            <span className="text-5xl">🍽️</span>
+            <h2 className="text-[17px] font-semibold text-[#1C1917] dark:text-[#FAFAF9]">
+              주변 식당을 모두 봤어요
+            </h2>
+            <p className="text-[14px] text-[#78716C] dark:text-[#A8A29E]">
+              {top3Liked.length > 0
+                ? '마음에 들었던 식당을 다시 확인해보세요'
+                : '반경을 넓히거나 조건을 바꿔보세요'}
+            </p>
+          </div>
+
+          {/* 카테고리별 Top 3 좋아요 식당 재표시 (#6) */}
+          {top3Liked.length > 0 && (
+            <div className="space-y-3">
+              <h3 className="text-[15px] font-semibold text-[#1C1917] dark:text-[#FAFAF9]">
+                좋아요한 식당
+              </h3>
+              {top3Liked.map((r) => (
+                <button
+                  key={r.placeId}
+                  onClick={() => window.open(r.mapUrl, '_blank')}
+                  className="w-full flex items-center gap-3 p-3 rounded-[12px] bg-[#F5F5F4] dark:bg-[#292524] hover:bg-[#E7E5E4] dark:hover:bg-[#3C3837] transition-colors text-left"
+                >
+                  {r.photoUrl && (
+                    <img
+                      src={r.photoUrl}
+                      alt={r.name}
+                      className="w-14 h-14 rounded-[8px] object-cover flex-shrink-0"
+                    />
+                  )}
+                  <div className="min-w-0 flex-1">
+                    <p className="text-[15px] font-semibold text-[#1C1917] dark:text-[#FAFAF9] truncate">
+                      {r.name}
+                    </p>
+                    <p className="text-[13px] text-[#78716C] dark:text-[#A8A29E]">
+                      {r.category} · {r.distanceM}m
+                    </p>
+                  </div>
+                  <span className="text-[13px] text-[#F97316] font-medium flex-shrink-0">
+                    지도 →
+                  </span>
+                </button>
+              ))}
+            </div>
+          )}
+
+          <div className="flex justify-center">
+            <button
+              onClick={() => setStep('filter')}
+              className="h-[52px] px-8 rounded-[12px] bg-[#F97316] hover:bg-[#EA580C] text-white text-[15px] font-semibold transition-colors"
+            >
+              조건 다시 설정
+            </button>
+          </div>
         </main>
       )}
     </div>

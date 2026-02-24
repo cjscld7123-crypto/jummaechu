@@ -68,6 +68,11 @@ export interface Restaurant {
   tags: ExcludeTag[]            // AI가 분류한 음식 특성 태그 (필터링에 활용)
   excluded: boolean             // customExcludes 기준 AI 제외 판정 결과
   description: string | null    // 한 줄 설명
+  bestReview: {                 // Google Places 베스트 리뷰 (별점 높은 순 1개)
+    text: string
+    rating: number
+    authorName: string
+  } | null
 }
 
 // ─── API 요청/응답 타입 ───────────────────────────────────────────

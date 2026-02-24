@@ -55,6 +55,13 @@ interface PlaceResult {
   types?: string[]
   editorialSummary?: { text: string }
   photos?: { name: string }[]
+  currentOpeningHours?: { openNow?: boolean }
+  businessStatus?: string // 'OPERATIONAL' | 'CLOSED_TEMPORARILY' | 'CLOSED_PERMANENTLY'
+  reviews?: {
+    text?: { text: string }
+    rating?: number
+    authorAttribution?: { displayName: string }
+  }[]
 }
 
 const FIELD_MASK = [
@@ -68,7 +75,13 @@ const FIELD_MASK = [
   'places.types',
   'places.editorialSummary',
   'places.photos',
+  'places.currentOpeningHours.openNow',
+  'places.businessStatus',
+  'places.reviews',
 ].join(',')
+
+// 점심시간대(10~14시) 술집/유흥업소 제외용 타입
+const BAR_TYPES = ['bar', 'night_club', 'liquor_store', 'wine_bar', 'pub']
 
 // ── 단일 Nearby Search 요청 ───────────────────────────────────────────
 async function searchNearby(
@@ -108,6 +121,7 @@ export async function GET(request: NextRequest) {
   const lat = parseFloat(searchParams.get('lat') ?? '')
   const lng = parseFloat(searchParams.get('lng') ?? '')
   const radius = parseInt(searchParams.get('radius') ?? '500')
+  const priceBand = searchParams.get('priceBand') as PriceBand | null
 
   if (isNaN(lat) || isNaN(lng)) {
     return NextResponse.json({ message: '위치 정보가 필요합니다.' }, { status: 400 })
@@ -138,16 +152,47 @@ export async function GET(request: NextRequest) {
     }
   }
 
-  if (merged.length === 0) {
+  // 1) 임시휴업 및 영업 전 매장 필터링
+  const open = merged.filter((place) => {
+    if (place.businessStatus === 'CLOSED_TEMPORARILY') return false
+    if (place.currentOpeningHours?.openNow === false) return false
+    return true
+  })
+
+  // 2) 가격대 필터링 (서버 사이드 — #4)
+  const priceFiltered = priceBand
+    ? open.filter((place) => {
+        const mapped = mapPriceBand(place.priceLevel)
+        // 가격 정보가 있고 선택한 가격대와 다르면 제외
+        return mapped === null || mapped === priceBand
+      })
+    : open
+
+  // 3) 점심시간대(10~14시) 술집/유흥업소 제외 (#7)
+  const hour = new Date().getHours()
+  const isLunchTime = hour >= 10 && hour < 14
+  const timeFiltered = isLunchTime
+    ? priceFiltered.filter((place) =>
+        !place.types?.some((t) => BAR_TYPES.includes(t))
+      )
+    : priceFiltered
+
+  if (timeFiltered.length === 0) {
     return NextResponse.json({ message: '주변에서 음식점을 찾지 못했어요.' }, { status: 404 })
   }
 
   // 서버에서 셔플 → 같은 위치/반경이어도 매 요청마다 다른 순서로 반환
-  const shuffled = shuffle(merged)
+  const shuffled = shuffle(timeFiltered)
 
   const restaurants: Restaurant[] = shuffled.map((place) => {
     const rLat = place.location?.latitude ?? lat
     const rLng = place.location?.longitude ?? lng
+
+    // 베스트 리뷰 선택 — 별점 높은 순 (#5)
+    const bestReviewRaw = place.reviews
+      ?.filter((r) => r.text?.text && r.rating)
+      ?.sort((a, b) => (b.rating ?? 0) - (a.rating ?? 0))[0] ?? null
+
     return {
       placeId: place.id ?? '',
       name: place.displayName?.text ?? '(이름 없음)',
@@ -169,6 +214,13 @@ export async function GET(request: NextRequest) {
       tags: [],
       excluded: false,
       description: place.editorialSummary?.text ?? null,
+      bestReview: bestReviewRaw
+        ? {
+            text: bestReviewRaw.text!.text!,
+            rating: bestReviewRaw.rating!,
+            authorName: bestReviewRaw.authorAttribution?.displayName ?? '익명',
+          }
+        : null,
     }
   })
 
