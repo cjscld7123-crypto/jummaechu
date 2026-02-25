@@ -309,10 +309,15 @@ export default function RecommendPage() {
       setCandidatePool(ranked)
 
       // #8-E: 첫 카드를 enrichment 완료 후 표시 (레이스 컨디션 해결)
+      // #13: 최대 5개까지만 시도하여 무한 로딩 방지
+      const MAX_ENRICH_ATTEMPTS = 5
       const localShown = new Set<string>()
       let first: Restaurant | null = null
+      let attempts = 0
 
       for (const candidate of ranked) {
+        if (attempts >= MAX_ENRICH_ATTEMPTS) break
+        attempts++
         const enriched = await enrichSingle(candidate, excludeTags, customExcludes)
         // candidatePool에 enrichment 결과 반영
         setCandidatePool((prev) =>
@@ -328,7 +333,7 @@ export default function RecommendPage() {
       }
 
       if (!first) {
-        setApiError('조건에 맞는 음식점이 없어요. 필터를 조정해보세요.')
+        setApiError('주변에 추천할 식당이 없어요. 필터를 조정해보세요.')
         setStep('filter')
         return
       }
@@ -448,7 +453,7 @@ export default function RecommendPage() {
                 <button
                   onClick={addCustomExclude}
                   disabled={!customInput.trim()}
-                  className="px-4 py-2.5 bg-[#F5F5F4] dark:bg-[#292524] disabled:opacity-40 text-[#78716C] dark:text-[#A8A29E] rounded-[10px] text-[14px] font-medium transition-colors hover:text-[#1C1917] dark:hover:text-[#FAFAF9]"
+                  className="px-4 py-2.5 rounded-[10px] text-[14px] font-medium transition-colors disabled:bg-[#F5F5F4] disabled:dark:bg-[#292524] disabled:text-[#78716C] disabled:dark:text-[#A8A29E] disabled:opacity-40 bg-[#F97316] hover:bg-[#EA580C] text-white"
                 >
                   추가
                 </button>
